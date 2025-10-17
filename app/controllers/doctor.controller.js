@@ -4,7 +4,7 @@ const { ObjectId } = require("mongodb");
 const fs = require("fs");
 const puppeteer = require("puppeteer");
 const axios = require("axios");
-const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
+const { RtcTokenBuilder, RtcRole } = require("agora-token");
 const ethi_doctor_master = db.ethi_doctor_master;
 const ethi_appointment_with_doctor = db.ethi_appointment_with_doctor;
 const ethi_subscription_plan = db.ethi_subscription_plan;
@@ -2964,7 +2964,17 @@ padding: 10px;
   let image_name = "diel_plan_simple.pdf";
   try {
     const browser = await puppeteer.launch({
-      headless: "new", // Opt in to the new Headless mode
+      headless: "new",
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ]
     });
     const page = await browser.newPage();
 

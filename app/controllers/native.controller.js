@@ -1,5 +1,4 @@
 const db = require("../models");
-const pdf = require("html-pdf");
 const path = require("path");
 const fs = require("fs");
 
@@ -7,7 +6,7 @@ const puppeteer = require("puppeteer");
 const axios = require("axios");
 const stripe_old = require("stripe")(process.env.STRIPE_LIVE_SECRET_KEY);
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
+const { RtcTokenBuilder, RtcRole } = require("agora-token");
 const ethi_customers = db.ethi_customers;
 const ethi_corporate = db.ethi_corporate;
 const ethi_goals_master = db.ethi_goals_master;
@@ -2881,7 +2880,17 @@ async function generatePDF(inputData) {
   let image_name = "sample.pdf";
   try {
     const browser = await puppeteer.launch({
-      headless: "new", // Opt in to the new Headless mode
+      headless: "new",
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ]
     });
     const page = await browser.newPage();
 

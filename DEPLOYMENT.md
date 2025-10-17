@@ -58,7 +58,8 @@ Before deploying, you need to set up the following environment variables in your
 3. **Configure the service:**
    - **Name**: Give your service a name (e.g., "ethi-backend")
    - **Environment**: Node
-   - **Build Command**: `npm install`
+   - **Node Version**: 22 (or use the .nvmrc file)
+   - **Build Command**: `npm install --omit=dev`
    - **Start Command**: `npm start`
    - **Plan**: Choose your preferred plan
 
@@ -90,6 +91,24 @@ For local development:
 4. Run `npm start` to start the development server
 
 ## Troubleshooting
+
+### Common Build Issues
+
+**npm install hanging/timeout:**
+- Use `npm ci --only=production` instead of `npm install`
+- Ensure Node.js version 22 is specified
+- Check that all dependencies are compatible
+
+**Puppeteer installation issues:**
+- The app now uses optimized puppeteer configuration for Render.com
+- If puppeteer still fails, consider using a different PDF generation library
+
+**Memory issues during build:**
+- Render.com free tier has limited memory
+- Consider upgrading to a paid plan if build consistently fails
+- Use `npm ci --only=production` to reduce memory usage
+
+### General Troubleshooting
 
 - **Build failures**: Check the build logs in Render dashboard
 - **Runtime errors**: Check the service logs in Render dashboard
