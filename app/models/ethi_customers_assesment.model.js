@@ -1,0 +1,52 @@
+module.exports = (mongoose) => {
+  const ethi_customers_assesment = mongoose.model(
+    "ethi_customers_assesment",
+    mongoose.Schema({
+      entry_date: String,
+      customer_id: String,
+      doctor_id: String,
+      subscription_id: String,
+      med_condition_name: String,
+      signs_name: String,
+      signs_name_other: String,
+      age_no_name: String,
+      medicines_name: String,
+      supplements_name: String,
+      allergy_name: String,
+      diseases_name: String,
+      bloodgroup_name: String,
+      height_name: String,
+      weight_number: String,
+      foodpre_name: String,
+      cuisines_name: String,
+      cravings_name: String,
+      food_alcohol_name: String,
+      food_biscuit_name: String,
+      food_diet_soda_name: String,
+      food_coffee_name: String,
+      food_tea_name: String,
+      triggers_name: String,
+      eathabits_name: String,
+      sleeptime_name: String,
+      waketime_name: String,
+      hungry_name: String,
+      stress_level_name: String,
+      water_name: String,
+      smoke_name: String,
+      menstrual_name: String,
+      endurance_name: String,
+      strength_training_name: String,
+      yoga_name: String,
+      flexibility_balance_name: String,
+      other_details_name: String,
+      other_option_name: String,
+      motivation_name: String,
+      flag: String,
+    },
+    {
+      timestamps: true, 
+    })
+  );
+
+  return ethi_customers_assesment;
+};
