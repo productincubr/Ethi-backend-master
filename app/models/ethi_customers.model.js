@@ -1,3 +1,4 @@
+// ethi_customers.model.js
 module.exports = (mongoose) => {
   const ethi_customers = mongoose.model(
     "ethi_customers",
@@ -51,7 +52,10 @@ module.exports = (mongoose) => {
         Comment: { type: String, default: null },
         response_by: { type: String, default: 0 }, // 0 means positive 1 means nagative
         customer_disease: { type: String, default: null },
+
+        // 🔽 OTP + login
         otp: String,
+        otp_expire_at: Date,   // ✅ NEW: 1 minute expiry ke liye
         login_step: String,
         flag: String,
       },

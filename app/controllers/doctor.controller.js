@@ -99,8 +99,13 @@ const appointment_exists = "Appointment Already Present.";
 const appointment_success = "Appointment Create Successfully";
 const mobile_already_present = "Mobile No Already Present.";
 
-// Retrieve all ethi_admin from the database.
-
+/**
+ * Doctor Login Controller
+ * 
+ * Authenticates doctor users with email and password
+ * Validates credentials against ethi_doctor_master collection
+ * Returns doctor data and profile image path on successful authentication
+ */
 exports.login_to_doctor = (req, res) => {
   if (!req.body) {
     res.send({
@@ -122,8 +127,15 @@ exports.login_to_doctor = (req, res) => {
       ethi_doctor_master
         .find(query)
         .then((data) => {
-          if (data) {
+          // Log query result for debugging
+          console.log("Doctor Login - Query Result:", data ? data.length : 0, "records found");
+          
+          // Check if any doctor records were found
+          if (data && data.length > 0) {
             const data_doctor = data[0];
+            
+            console.log("Doctor found:", data_doctor.doctor_email);
+            
             const responseData = {
               data_doctor,
               data_doctor_image,
@@ -133,6 +145,8 @@ exports.login_to_doctor = (req, res) => {
               error: false,
             });
           } else {
+            // No doctor found with provided credentials
+            console.log("No doctor found with email:", req.body.useremail);
             res.send({
               message: user_msg,
               error: true,

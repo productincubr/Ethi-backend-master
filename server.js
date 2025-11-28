@@ -77,11 +77,10 @@ require("./app/routes/native.routes")(app);
 require("./app/routes/doctor.routes")(app);
 require("./app/routes/web.routes")(app);
 require("./app/routes/wati.routes")(app);
+
+
 db.mongoose
-  .connect(db.uri, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  })
+  .connect(db.uri, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => {
     console.log("Connected to the database!");
   })
