@@ -103,7 +103,14 @@ const data_notification_image = "/ethi_notification_image/";
 
 const data_query_image = "/ethi_query_master_image/";
 const data_doctor_image = "/ethi_doctor_image/";
-// Retrieve all ethi_admin from the database.
+
+/**
+ * Admin Login Controller
+ * 
+ * Authenticates admin users with email and password
+ * Validates credentials against ethi_admin collection
+ * Returns admin data and profile image path on successful authentication
+ */
 exports.login_to_superadmin = (req, res) => {
   if (!req.body) {
     res.send({
@@ -125,8 +132,15 @@ exports.login_to_superadmin = (req, res) => {
       ethi_admin
         .find(query)
         .then((data) => {
-          if (data) {
+          // Log query result for debugging
+          console.log("Admin Login - Query Result:", data ? data.length : 0, "records found");
+          
+          // Check if any admin records were found
+          if (data && data.length > 0) {
             const data_admin = data[0];
+            
+            console.log("Admin found:", data_admin.admin_email);
+            
             const responseData = {
               data_admin,
               data_doctor_image,
@@ -137,6 +151,8 @@ exports.login_to_superadmin = (req, res) => {
               error: false,
             });
           } else {
+            // No admin found with provided credentials
+            console.log("No admin found with email:", req.body.useremail);
             res.send({
               message: user_msg,
               error: true,
