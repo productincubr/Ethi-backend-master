@@ -7,6 +7,7 @@ const db = {};
 db.mongoose = mongoose;
 db.uri = dbConfig.uri;
 db.ethi_admin = require("./ethi_admin.model.js")(mongoose);
+db.ethi_super_admin = require("./ethi_super_admin.model.js")(mongoose);
 db.ethi_customers = require("./ethi_customers.model.js")(mongoose);
 db.ethi_corporate = require("./ethi_corporate.model.js")(mongoose);
 db.ethi_goals_master = require("./ethi_goals_master.model.js")(mongoose);
@@ -44,6 +45,10 @@ db.ethi_remember_master = require("./ethi_remember_master.model.js")(mongoose);
 db.ethi_doctors_goals = require("./ethi_doctors_goals.model.js")(mongoose);
 db.ethi_doctor_feedback = require("./ethi_doctor_feedback.model.js")(mongoose);
 db.ethi_customer_wati_temp = require("./ethi_customer_wati_temp.model.js")(mongoose);
+
+// ✅ NEW: access request model
+db.ethi_access_request = require("./ethi_access_request.model.js")(mongoose);
+
 
 module.exports = db;
 

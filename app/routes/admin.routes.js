@@ -1,6 +1,6 @@
 module.exports = app => {
     const admin_link = require("../controllers/admin.controller.js");
-    const web_link = require("../controllers/wati.controller");
+    const web_link = require("../controllers/wati.controller.js");
     var router = require("express").Router();
 
 
@@ -32,6 +32,7 @@ module.exports = app => {
     router.post("/get_all_staff", admin_link.get_all_staff);
     router.post("/get_all_admin", admin_link.get_all_admin);
     router.post("/update_staff", admin_link.update_staff);
+    router.post("/update_own_profile", admin_link.update_own_profile);
     router.post("/update_doctor", admin_link.update_doctor);
 
     router.post("/get_quote", admin_link.get_quote);

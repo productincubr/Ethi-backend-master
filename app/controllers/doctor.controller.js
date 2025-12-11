@@ -5,6 +5,12 @@ const fs = require("fs");
 const puppeteer = require("puppeteer");
 const axios = require("axios");
 const { RtcTokenBuilder, RtcRole } = require("agora-token");
+const crypto = require("crypto");
+
+// ✅ Import JWT and Password helpers
+const { generateToken } = require("../middleware/auth.middleware");
+const { hashPassword, comparePassword } = require("../helpers/password.helper");
+
 const ethi_doctor_master = db.ethi_doctor_master;
 const ethi_appointment_with_doctor = db.ethi_appointment_with_doctor;
 const ethi_subscription_plan = db.ethi_subscription_plan;
@@ -42,7 +48,7 @@ const agrora_link = website_link + "customervideocall/";
 /**wati key */
 
 const data_user_document_image = "/ethi_user_document/";
-const crypto = require("crypto");
+
 // Generate an MD5 hash for a value (e.g., microtime)
 function generateMD5Hash() {
   const microtime = new Date().getTime().toString();
@@ -106,7 +112,7 @@ const mobile_already_present = "Mobile No Already Present.";
  * Validates credentials against ethi_doctor_master collection
  * Returns doctor data and profile image path on successful authentication
  */
-exports.login_to_doctor = (req, res) => {
+exports.login_to_doctor = async (req, res) => {
   if (!req.body) {
     res.send({
       message: post_empty,
@@ -115,51 +121,85 @@ exports.login_to_doctor = (req, res) => {
   } else {
     try {
       const user_email = req.body.useremail;
-      const user_passowrd_enq = make_password(req.body.userpassword);
+      const user_password = req.body.userpassword;
 
+      // Find doctor by email only
       const query = {
-        $and: [
-          { doctor_email: user_email },
-          { doctor_passowrd_enq: user_passowrd_enq },
-          // Add more conditions as needed
-        ],
+        doctor_email: user_email,
       };
-      ethi_doctor_master
-        .find(query)
-        .then((data) => {
-          // Log query result for debugging
-          console.log("Doctor Login - Query Result:", data ? data.length : 0, "records found");
-          
-          // Check if any doctor records were found
-          if (data && data.length > 0) {
-            const data_doctor = data[0];
-            
-            console.log("Doctor found:", data_doctor.doctor_email);
-            
-            const responseData = {
-              data_doctor,
-              data_doctor_image,
-            };
-            res.send({
-              message: responseData,
-              error: false,
-            });
-          } else {
-            // No doctor found with provided credentials
-            console.log("No doctor found with email:", req.body.useremail);
-            res.send({
-              message: user_msg,
-              error: true,
-            });
+
+      const data = await ethi_doctor_master.find(query);
+      
+      console.log("Doctor Login - Query Result:", data ? data.length : 0, "records found");
+      
+      if (data && data.length > 0) {
+        const data_doctor = data[0];
+        const stored_password = data_doctor.doctor_passowrd_enq;
+
+        // 🔐 Check password (supports both MD5 and Bcrypt)
+        let isPasswordValid = false;
+
+        // Try Bcrypt first (new format)
+        if (stored_password && stored_password.startsWith('$2b$')) {
+          console.log("🔐 Verifying Bcrypt password...");
+          isPasswordValid = await comparePassword(user_password, stored_password);
+        } else {
+          // Fall back to MD5 (old format)
+          console.log("🔐 Verifying MD5 password (legacy)...");
+          const md5_hash = make_password(user_password);
+          isPasswordValid = (stored_password === md5_hash);
+
+          // 🔄 Auto-migrate to Bcrypt on successful login
+          if (isPasswordValid) {
+            console.log("✅ MD5 password correct. Auto-migrating to Bcrypt...");
+            const bcrypt_hash = await hashPassword(user_password);
+            await ethi_doctor_master.updateOne(
+              { _id: data_doctor._id },
+              { $set: { doctor_passowrd_enq: bcrypt_hash } }
+            );
+            console.log("✅ Password migrated to Bcrypt successfully");
           }
-        })
-        .catch((err) => {
-          res.send({
-            message: error_msg,
+        }
+
+        if (!isPasswordValid) {
+          console.log("❌ Invalid password for:", user_email);
+          return res.send({
+            message: "Invalid email or password",
             error: true,
           });
+        }
+
+        console.log("✅ Doctor found:", data_doctor.doctor_email);
+
+        // 🎫 Generate JWT Token
+        const jwtToken = generateToken({
+          _id: data_doctor._id,
+          email: data_doctor.doctor_email,
+          role: 'DOCTOR',
+          type: 'doctor',
         });
+
+        console.log("✅ JWT token generated for doctor:", data_doctor.doctor_email);
+
+        const responseData = {
+          data_doctor,
+          data_doctor_image,
+          token: jwtToken, // ✅ JWT token
+        };
+
+        res.send({
+          message: responseData,
+          error: false,
+        });
+      } else {
+        console.log("No doctor found with email:", req.body.useremail);
+        res.send({
+          message: user_msg,
+          error: true,
+        });
+      }
     } catch (err) {
+      console.log("❌ Doctor login error:", err);
       res.send({
         message: error_msg,
         error: true,
