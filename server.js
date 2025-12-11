@@ -78,6 +78,9 @@ require("./app/routes/doctor.routes")(app);
 require("./app/routes/web.routes")(app);
 require("./app/routes/wati.routes")(app);
 
+// Auth routes
+require("./app/routes/auth.routes")(app);
+
 
 db.mongoose
   .connect(db.uri, { useNewUrlParser: true, useUnifiedTopology: true })

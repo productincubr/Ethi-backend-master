@@ -4,7 +4,15 @@ const fs = require("fs");
 const csv = require("csv-parser");
 const crypto = require("crypto");
 const { CLIENT_RENEG_LIMIT } = require("tls");
+
+// ✅ Import JWT and Password helpers
+const { generateToken } = require("../middleware/auth.middleware");
+const { hashPassword, comparePassword } = require("../helpers/password.helper");
+const { processAndSaveImage, deleteImage } = require("../helpers/image.helper");
+
 const ethi_admin = db.ethi_admin;
+const ethi_super_admin = db.ethi_super_admin; // ✅ Super admin collection for owners
+const ethi_access_request = db.ethi_access_request; // ✅ Pending approval requests
 const ethi_goals_master = db.ethi_goals_master;
 const ethi_front_master = db.ethi_front_master;
 const ethi_admin_master = db.ethi_admin_master;
@@ -56,10 +64,12 @@ function generateMD5Hash() {
   const md5Hash = crypto.createHash("md5").update(microtime).digest("hex");
   return md5Hash;
 }
+
 function make_password(new_value) {
   const md5Hash = crypto.createHash("md5").update(new_value).digest("hex");
   return md5Hash;
 }
+
 function currentDatetime() {
   const currentDate = new Date();
   const currentDateTime = currentDate
@@ -111,70 +121,251 @@ const data_doctor_image = "/ethi_doctor_image/";
  * Validates credentials against ethi_admin collection
  * Returns admin data and profile image path on successful authentication
  */
-exports.login_to_superadmin = (req, res) => {
-  if (!req.body) {
+
+/**
+ * ===== ADMIN ROLES & HELPERS =====
+ * 
+ * admin_type field (ethi_admin collection) will be used as:
+ * - "SUPER_ADMIN"  => full access (can add/edit admins, doctors, settings etc.)
+ * - "ADMIN"        => limited access (own profile, limited dashboards)
+ * 
+ * These helper functions ensure:
+ * - Every "dangerous" action (add_staff, update_staff, get_all_admin, etc.)
+ *   is only allowed for SUPER_ADMIN.
+ */
+
+const ADMIN_ROLES = {
+  SUPER_ADMIN: "SUPER_ADMIN",
+  ADMIN: "ADMIN",
+};
+
+/**
+ * Get requester admin document using requester_admin_id from body.
+ * 
+ * Frontend must send:
+ *  - requester_admin_id : logged in admin _id (Mongo id string)
+ */
+async function getRequesterAdmin(req, res) {
+  try {
+    const requesterId = req.body.requester_admin_id;
+
+    if (!requesterId) {
+      res.send({
+        error: true,
+        message: "requester_admin_id is required for this action",
+      });
+      return null;
+    }
+
+    const admin = await ethi_admin.findOne({
+      _id: requesterId,
+      flag: "c",
+    });
+
+    if (!admin) {
+      res.send({
+        error: true,
+        message: "Requester admin not found or inactive",
+      });
+      return null;
+    }
+
+    return admin;
+  } catch (err) {
+    console.log("getRequesterAdmin error:", err);
     res.send({
+      error: true,
+      message: error_msg,
+    });
+    return null;
+  }
+}
+
+/**
+ * Ensure that current requester is SUPER_ADMIN.
+ * 
+ * - Returns SUPER_ADMIN document if allowed
+ * - Sends error response and returns null if not allowed
+ */
+async function assertSuperAdmin(req, res) {
+  const admin = await getRequesterAdmin(req, res);
+  if (!admin) return null;
+
+  if (admin.admin_type !== ADMIN_ROLES.SUPER_ADMIN) {
+    res.send({
+      error: true,
+      message:
+        "Permission denied. Only SUPER_ADMIN can perform this action.",
+    });
+    return null;
+  }
+
+  // If in future you want to lock admin:
+  // if (admin.allow_access === "0") { ... }
+
+  return admin;
+}
+
+
+/**
+ * Admin Login Controller
+ *
+ * PURPOSE:
+ * - Authenticate admin (super_admin or admin) using email + password
+ * - Check if admin account is active
+ * - Return admin data including role + image path
+ */
+exports.login_to_superadmin = async (req, res) => {
+  if (!req.body) {
+    return res.send({
       message: post_empty,
       error: true,
     });
-  } else {
-    try {
-      const user_email = req.body.useremail;
-      const user_passowrd_enq = make_password(req.body.userpassword);
+  }
 
-      const query = {
-        $and: [
-          { admin_email: user_email },
-          { admin_passowrd_enq: user_passowrd_enq },
-        ],
+  try {
+    const user_email = req.body.useremail;
+    const user_password = req.body.userpassword;
+
+    // Find admin by email in both collections
+    const query = {
+      $and: [
+        { admin_email: user_email },
+        { flag: "c" },
+      ],
+    };
+
+    // Check super admin collection first (for owners)
+    let data_admin = await ethi_super_admin.findOne({ admin_email: user_email });
+    let isSuperAdmin = !!data_admin;
+
+    // If not found in super admin, check regular admin collection
+    if (!data_admin) {
+      const regularAdmins = await ethi_admin.find(query);
+      data_admin = regularAdmins && regularAdmins.length > 0 ? regularAdmins[0] : null;
+    }
+    
+    console.log(
+      "Admin Login - Found in:",
+      isSuperAdmin ? "ethi_super_admin (Owner)" : data_admin ? "ethi_admin (Team Member)" : "Not Found"
+    );
+
+    // If not found in approved collections, check if user is pending approval
+    if (!data_admin) {
+      const pendingRequest = await ethi_access_request.findOne({ admin_email: user_email });
+      
+      if (pendingRequest) {
+        console.log("⏳ User found in pending requests:", user_email);
+        return res.send({
+          message: "Your account is pending approval. Please wait for the owner to approve your request. You will receive an email notification once approved.",
+          error: true,
+          pending: true, // Flag to indicate pending status
+        });
+      }
+    }
+
+    if (data_admin) {
+      const stored_password = data_admin.admin_passowrd_enq;
+
+      // 🔐 Check password (supports both MD5 and Bcrypt)
+      let isPasswordValid = false;
+
+      // Try Bcrypt first (new format - starts with $2b$)
+      if (stored_password && stored_password.startsWith('$2b$')) {
+        console.log("🔐 Verifying Bcrypt password...");
+        isPasswordValid = await comparePassword(user_password, stored_password);
+      } else {
+        // Fall back to MD5 (old format)
+        console.log("🔐 Verifying MD5 password (legacy)...");
+        const md5_hash = make_password(user_password);
+        isPasswordValid = (stored_password === md5_hash);
+
+        // 🔄 Auto-migrate to Bcrypt on successful login
+        if (isPasswordValid) {
+          console.log("✅ MD5 password correct. Auto-migrating to Bcrypt...");
+          const bcrypt_hash = await hashPassword(user_password);
+          
+          // Update in correct collection
+          if (isSuperAdmin) {
+            await ethi_super_admin.updateOne(
+              { _id: data_admin._id },
+              { $set: { admin_passowrd_enq: bcrypt_hash } }
+            );
+          } else {
+            await ethi_admin.updateOne(
+              { _id: data_admin._id },
+              { $set: { admin_passowrd_enq: bcrypt_hash } }
+            );
+          }
+          console.log("✅ Password migrated to Bcrypt successfully in", isSuperAdmin ? "super_admin" : "admin", "collection");
+        }
+      }
+
+      if (!isPasswordValid) {
+        console.log("❌ Invalid password for:", user_email);
+        return res.send({
+          message: "Invalid email or password",
+          error: true,
+        });
+      }
+
+      // Determine role
+      const userRole = data_admin.role || 
+                      data_admin.admin_type || 
+                      (data_admin.is_super_admin ? "super_admin" : "admin");
+
+      console.log("Admin found:", data_admin.admin_email, "role:", userRole);
+
+      // ✅ Check if account is active
+      if (data_admin.allow_access === "0" || data_admin.allow_access === 0) {
+        console.log("Admin account is disabled:", data_admin.admin_email);
+        return res.send({
+          message: "Your account has been disabled. Please contact Super Admin.",
+          error: true,
+        });
+      }
+
+      // 🎫 Generate JWT Token
+      const jwtToken = generateToken({
+        _id: data_admin._id,
+        email: data_admin.admin_email,
+        role: userRole,
+        type: 'admin',
+      });
+
+      console.log("✅ JWT token generated for:", data_admin.admin_email);
+
+      // Frontend ko role, data aur token bhejo
+      const responseData = {
+        data_admin: {
+          ...data_admin._doc,
+          role: userRole,
+          is_super_admin: userRole === "super_admin",
+        },
+        data_doctor_image,
+        token: jwtToken, // ✅ JWT token
       };
 
-      ethi_admin
-        .find(query)
-        .then((data) => {
-          // Log query result for debugging
-          console.log("Admin Login - Query Result:", data ? data.length : 0, "records found");
-          
-          // Check if any admin records were found
-          if (data && data.length > 0) {
-            const data_admin = data[0];
-            
-            console.log("Admin found:", data_admin.admin_email);
-            
-            const responseData = {
-              data_admin,
-              data_doctor_image,
-            };
-
-            res.send({
-              message: responseData,
-              error: false,
-            });
-          } else {
-            // No admin found with provided credentials
-            console.log("No admin found with email:", req.body.useremail);
-            res.send({
-              message: user_msg,
-              error: true,
-            });
-          }
-        })
-        .catch((err) => {
-          console.log(err);
-          res.send({
-            message: error_msg,
-            error: true,
-          });
-        });
-    } catch (error) {
-      console.log(error);
-      res.send({
-        message: error_msg,
+      return res.send({
+        message: responseData,
+        error: false,
+      });
+    } else {
+      console.log("No admin found with email:", user_email);
+      return res.send({
+        message: user_msg,
         error: true,
       });
     }
+  } catch (error) {
+    console.log("❌ Login error:", error);
+    return res.send({
+      message: error_msg,
+      error: true,
+    });
   }
 };
+
 
 // Retrieve login data for user
 exports.welcome_page = async (req, res) => {
@@ -271,291 +462,230 @@ exports.create_appointments_by_admin = async (req, res) => {
       message: post_empty,
       error: true,
     });
-  } else {
-    try {
-      const admin_id = req.body.admin_id;
-      const user_customer_mobile_no = req.body.user_customer_mobile_no;
-      const selected_date_id = req.body.selected_date;
-      const selected_time_id = req.body.selected_time;
-      const query = {
-        $and: [
-          {
-            mobile_no_without_zip: user_customer_mobile_no,
-          },
-        ],
-      };
-      ethi_customers
-        .find(query)
-        .then(async (data) => {
-          if (data[0]) {
-            if (data[0].last_subscription_id !== "") {
-              const package_start_date = new Date(data[0].package_start_date);
-              const package_end_date = new Date(data[0].package_end_date);
-              const current_date = new Date();
-              const current_date_entry = new Date(selected_date_id);
+    return;
+  }
 
-              if (
-                current_date >= package_start_date &&
-                current_date <= package_end_date
-              ) {
-                if (
-                  current_date_entry >= package_start_date &&
-                  current_date_entry <= package_end_date
-                ) {
-                  const customer_id_id = data[0]._id;
-                  const doctor_id_id = data[0].last_doctor_id;
-                  const subscription_id_dd = data[0].last_subscription_id;
+  try {
+    const admin_id = req.body.admin_id;
+    const user_customer_mobile_no = req.body.user_customer_mobile_no;
+    const user_customer_mobile_name = req.body.user_customer_mobile_name || "New Patient";
+    const selected_date_id = req.body.selected_date;
+    const selected_time_id = req.body.selected_time;
+    const consultation_category = req.body.category || "initial";
+    const occurrence_type = req.body.occurrence || "one_time";
 
-                  const query = {
-                    $and: [
-                      {
-                        doctor_id: doctor_id_id,
-                      },
-                      {
-                        booking_date: selected_date_id,
-                      },
-                      {
-                        booking_start_time: selected_time_id,
-                      },
-                    ],
-                  };
+    console.log("📞 Creating appointment for:", user_customer_mobile_no);
 
-                  var condition6 = {
-                    flag: "c",
-                    customer_id: customer_id_id,
-                    subscription_id: subscription_id_dd,
-                    doctor_id: doctor_id_id,
-                    status_for_complete: "0",
-                  };
+    // Check if customer exists
+    const existingCustomer = await ethi_customers.findOne({
+      mobile_no_without_zip: user_customer_mobile_no,
+    });
 
-                  const data_count_apponiment_data =
-                    await ethi_appointment_with_doctor
-                      .find(condition6)
-                      .limit(2)
-                      .sort({ createdAt: -1 })
-                      .exec();
+    let customer_id_id;
+    let customer_name_dd;
+    let customer_mobile_no_dd;
+    let customer_image_dd;
+    let doctor_id_id;
+    let subscription_id_dd;
+    let package_start_date;
+    let package_end_date;
+    let is_new_customer = false;
 
-                  if (data_count_apponiment_data[0]) {
-                    res.send({
-                      message:
-                        "Already Appointment on " +
-                        data_count_apponiment_data[0].booking_date +
-                        " Time " +
-                        data_count_apponiment_data[0].booking_start_time,
-                      error: true,
-                    });
-                  } else {
-                    var condition4 = {
-                      flag: "c",
-                      customer_id: customer_id_id,
-                      subscription_id: subscription_id_dd,
-                      doctor_id: doctor_id_id,
-                      status_for_complete: "1",
-                    };
-                    const count_apponiment = await ethi_appointment_with_doctor
-                      .countDocuments(condition4)
-                      .exec();
-                    let time_add = 30;
-                    if (count_apponiment > 1) {
-                      time_add = 15;
-                    }
+    if (existingCustomer) {
+      // ✅ EXISTING CUSTOMER - Use their data
+      console.log("✅ Customer found:", existingCustomer.customer_name);
+      
+      customer_id_id = existingCustomer._id;
+      customer_name_dd = existingCustomer.customer_name;
+      customer_mobile_no_dd = existingCustomer.customer_mobile_no;
+      customer_image_dd = existingCustomer.customer_image;
+      doctor_id_id = existingCustomer.last_doctor_id || "0";
+      subscription_id_dd = existingCustomer.last_subscription_id || "free_consultation";
+      package_start_date = existingCustomer.package_start_date || new Date();
+      package_end_date = existingCustomer.package_end_date || new Date(new Date().setMonth(new Date().getMonth() + 1));
 
-                    var condition3 = {
-                      flag: "c",
-                      _id: doctor_id_id,
-                    };
-                    const data_customers_data = data;
-                    const ethi_doctor_master_data = await ethi_doctor_master
-                      .find(condition3)
-                      .exec();
+    } else {
+      // ✅ NEW CUSTOMER - Create profile automatically
+      console.log("📝 Creating new customer profile for:", user_customer_mobile_name);
+      is_new_customer = true;
+      
+      const newCustomer = new ethi_customers({
+        customer_name: user_customer_mobile_name,
+        customer_mobile_no: "+91" + user_customer_mobile_no,
+        mobile_no_without_zip: user_customer_mobile_no,
+        customer_email: "",
+        customer_image: "user_image.png",
+        customer_dob: "",
+        customer_gender: "",
+        customer_medical_history: "",
+        entry_date: currentDatetime(),
+        login_step: "0",
+        last_doctor_id: "0",
+        last_subscription_id: "free_consultation",
+        package_start_date: new Date(),
+        package_end_date: new Date(new Date().setMonth(new Date().getMonth() + 1)),
+        flag: "c",
+      });
 
-                    let customer_name_dd = "User";
-                    let customer_mobile_no_dd = "";
-                    let customer_image_dd = "";
-                    if (data_customers_data[0]) {
-                      customer_name_dd = data_customers_data[0].customer_name;
-                      customer_mobile_no_dd =
-                        data_customers_data[0].customer_mobile_no;
-                      customer_image_dd = data_customers_data[0].customer_image;
-                    }
+      const savedCustomer = await newCustomer.save();
+      console.log("✅ New customer created with ID:", savedCustomer._id);
 
-                    let doctor_name_dd = "";
-                    let doctor_tag_dd = "";
-                    let doctor_image_dd = "";
-                    if (ethi_doctor_master_data[0]) {
-                      doctor_name_dd = ethi_doctor_master_data[0].doctor_name;
-                      doctor_tag_dd = ethi_doctor_master_data[0].doctor_tag;
-                      doctor_image_dd = ethi_doctor_master_data[0].doctor_image;
-                    }
+      customer_id_id = savedCustomer._id;
+      customer_name_dd = savedCustomer.customer_name;
+      customer_mobile_no_dd = savedCustomer.customer_mobile_no;
+      customer_image_dd = savedCustomer.customer_image;
+      doctor_id_id = "0";
+      subscription_id_dd = "free_consultation";
+      package_start_date = savedCustomer.package_start_date;
+      package_end_date = savedCustomer.package_end_date;
+    }
 
-                    ethi_appointment_with_doctor
-                      .findOne(query)
-                      .then((existingCustomer) => {
-                        if (existingCustomer) {
-                          res.send({
-                            message: appointment_exists,
-                            error: true,
-                          });
-                        } else {
-                          const booking_end_time_dd = add_time(
-                            selected_time_id,
-                            time_add
-                          );
-                          let make_sec = convertinsec(
-                            selected_date_id,
-                            booking_end_time_dd
-                          );
-                          let token_agora_dd = generateAgoraToken(
-                            customer_id_id,
-                            make_sec
-                          );
+    // Validate date is within package period
+    const selected_date_obj = new Date(selected_date_id);
+    const current_date = new Date();
 
-                          const ethi_appointment_with_doctor_ss =
-                            new ethi_appointment_with_doctor({
-                              entry_date: currentDatetime(),
-                              doctor_id: doctor_id_id,
-                              subscription_id: subscription_id_dd,
-                              doctor_name: doctor_name_dd,
-                              doctor_tag: doctor_tag_dd,
-                              doctor_image: doctor_image_dd,
-                              customer_id: customer_id_id,
-                              customer_name: customer_name_dd,
-                              customer_mobile_no: customer_mobile_no_dd,
-                              customer_image: customer_image_dd,
-                              booking_date: selected_date_id,
-                              booking_start_time: selected_time_id,
-                              booking_end_time: booking_end_time_dd,
-                              which_no_booking: count_apponiment,
-                              occurrence: "",
-                              category: "",
-                              description: "",
-                              diet_plan_status: "0",
-                              assesment_form_status: "0",
-                              token_agora: token_agora_dd,
-                              status_for_complete: "0",
-                              book_by: "admin",
-                              flag: "c",
-                            });
-
-                          const newCustomer = new ethi_appointment_with_doctor(
-                            ethi_appointment_with_doctor_ss
-                          );
-                          newCustomer
-                            .save()
-                            .then((savedCustomer) => {
-                              let id_booking = savedCustomer._id;
-                              const filter = {
-                                _id: customer_id_id,
-                              };
-
-                              const update = {
-                                $set: {
-                                  login_step: "2",
-                                },
-                              };
-
-                              ethi_customers
-                                .updateOne(filter, update, {
-                                  useFindAndModify: false,
-                                })
-                                .then((data) => {
-
-                                  
-                                  const requestBody = {
-                                    template_name: "agora_link",
-                                    broadcast_name: "agora_link",
-                                    receivers: [
-                                      {
-                                        whatsappNumber: customer_mobile_no_dd,
-                                        customParams: [
-                                          {
-                                            name: "link",
-                                            value: agrora_link + id_booking,
-                                          },
-                                          {
-                                            name: "ordernumber",
-                                            value: selected_date_id,
-                                          },
-                                          {
-                                            name: "tracking_company",
-                                            value: booking_start_time,
-                                          },
-                                        ],
-                                      },
-                                    ],
-                                  };
-
-                                  //wati hit data
-                                  sendwatitemplete(requestBody);
-                                  res.send({
-                                    message: appointment_success,
-                                    error: false,
-                                  });
-                                })
-                                .catch((err) => {
-                                  console.log(err);
-                                  res.send({
-                                    message: error_msg,
-                                    error: true,
-                                  });
-                                });
-                            })
-                            .catch((err) => {
-                              console.log(err);
-                              res.send({
-                                message: error_msg,
-                                error: true,
-                              });
-                            });
-                        }
-                      })
-                      .catch((err) => {
-                        console.log(err);
-                        res.send({
-                          message: error_msg,
-                          error: true,
-                        });
-                      });
-                  }
-                } else {
-                  res.send({
-                    message: appointment_error_date,
-                    error: true,
-                  });
-                }
-              } else {
-                res.send({
-                  message: appointment_error_package,
-                  error: true,
-                });
-              }
-            } else {
-              res.send({
-                message: appointment_error_subscribe,
-                error: true,
-              });
-            }
-          } else {
-            res.send({
-              message: appointment_error_singup,
-              error: true,
-            });
-          }
-        })
-        .catch((err) => {
-          console.log(err);
-          res.send({
-            message: error_msg,
-            error: true,
-          });
-        });
-    } catch (error) {
-      console.log(error);
-      res.send({
-        message: error_msg,
+    if (selected_date_obj < package_start_date || selected_date_obj > package_end_date) {
+      console.log("⚠️ Date outside package period");
+      return res.send({
+        message: appointment_error_date,
         error: true,
       });
     }
+
+    // Check for duplicate appointment
+    const duplicateAppointment = await ethi_appointment_with_doctor.findOne({
+      customer_id: customer_id_id,
+      doctor_id: doctor_id_id,
+      booking_date: selected_date_id,
+      booking_start_time: selected_time_id,
+      status_for_complete: { $ne: "2" }, // Not cancelled
+    });
+
+    if (duplicateAppointment) {
+      console.log("⚠️ Duplicate appointment found");
+      return res.send({
+        message: `Already Appointment on ${selected_date_id} Time ${selected_time_id}`,
+        error: true,
+      });
+    }
+
+    // Count existing appointments
+    const appointmentCount = await ethi_appointment_with_doctor.countDocuments({
+      flag: "c",
+      customer_id: customer_id_id,
+      subscription_id: subscription_id_dd,
+      doctor_id: doctor_id_id,
+      status_for_complete: "1",
+    });
+
+    let time_add = appointmentCount > 1 ? 15 : 30;
+
+    // Get doctor information
+    let doctor_name_dd = "To Be Assigned";
+    let doctor_tag_dd = "";
+    let doctor_image_dd = "user_image.png";
+
+    if (doctor_id_id && doctor_id_id !== "0") {
+      const doctor = await ethi_doctor_master.findById(doctor_id_id);
+      if (doctor) {
+        doctor_name_dd = doctor.doctor_name;
+        doctor_tag_dd = doctor.doctor_tag;
+        doctor_image_dd = doctor.doctor_image;
+      }
+    }
+
+    // Calculate end time
+    const booking_end_time_dd = add_time(selected_time_id, time_add);
+    
+    // Generate Agora token
+    let make_sec = convertinsec(selected_date_id, booking_end_time_dd);
+    let token_agora_dd = generateAgoraToken(customer_id_id, make_sec);
+
+    // Create appointment
+    const newAppointment = new ethi_appointment_with_doctor({
+      entry_date: currentDatetime(),
+      doctor_id: doctor_id_id,
+      subscription_id: subscription_id_dd,
+      doctor_name: doctor_name_dd,
+      doctor_tag: doctor_tag_dd,
+      doctor_image: doctor_image_dd,
+      customer_id: customer_id_id,
+      customer_name: customer_name_dd,
+      customer_mobile_no: customer_mobile_no_dd,
+      customer_image: customer_image_dd,
+      booking_date: selected_date_id,
+      booking_start_time: selected_time_id,
+      booking_end_time: booking_end_time_dd,
+      which_no_booking: appointmentCount.toString(),
+      occurrence: occurrence_type,
+      category: consultation_category,
+      description: req.body.description || "",
+      diet_plan_status: "0",
+      assesment_form_status: "0",
+      token_agora: token_agora_dd,
+      status_for_complete: "0",
+      book_by: "admin",
+      flag: "c",
+    });
+
+    const savedAppointment = await newAppointment.save();
+    console.log("✅ Appointment created:", savedAppointment._id);
+
+    // Update customer login step
+    await ethi_customers.updateOne(
+      { _id: customer_id_id },
+      { $set: { login_step: "2" } }
+    );
+
+    // Send WhatsApp notification
+    try {
+      const requestBody = {
+        template_name: "agora_link",
+        broadcast_name: "agora_link",
+        receivers: [
+          {
+            whatsappNumber: customer_mobile_no_dd,
+            customParams: [
+              {
+                name: "link",
+                value: agrora_link + savedAppointment._id,
+              },
+              {
+                name: "ordernumber",
+                value: selected_date_id,
+              },
+              {
+                name: "tracking_company",
+                value: selected_time_id,
+              },
+            ],
+          },
+        ],
+      };
+      sendwatitemplete(requestBody);
+    } catch (whatsappError) {
+      console.log("⚠️ WhatsApp notification failed:", whatsappError.message);
+    }
+
+    res.send({
+      message: is_new_customer 
+        ? "New patient registered and appointment created successfully!" 
+        : appointment_success,
+      error: false,
+      data: {
+        appointment_id: savedAppointment._id,
+        customer_id: customer_id_id,
+        customer_name: customer_name_dd,
+        is_new_customer: is_new_customer,
+      },
+    });
+
+  } catch (error) {
+    console.error("❌ Appointment creation error:", error);
+    res.status(500).send({
+      message: "Failed to create appointment: " + error.message,
+      error: true,
+    });
   }
 };
 
@@ -1475,225 +1605,414 @@ exports.ethi_query_master_get = async (req, res) => {
 };
 
 // Retrieve all ethi_admin from the database.
-exports.add_staff = (req, res) => {
+// Create a new Admin Staff (SUPER_ADMIN only)
+/**
+ * ✅ ADD STAFF - ONLY Super Admin can add new admins
+ * 
+ * Permission: Super Admin ONLY
+ * Restriction: Cannot create another super_admin
+ */
+exports.add_staff = async (req, res) => {
   if (!req.body) {
-    res.send({
+    return res.send({
       message: post_empty,
       error: true,
     });
-  } else {
-    try {
-      const admin_email_ss = req.body.admin_email;
-      const admin_name_ss = req.body.admin_name;
-      const admin_mobile_no_ss = req.body.admin_mobile_no;
-      const admin_type_ss = req.body.admin_type;
-      const admin_city_ss = req.body.admin_city;
-      const admin_country_ss = req.body.admin_country;
-      const admin_education_ss = req.body.admin_education;
+  }
 
-      const admin_join_date_ss = req.body.admin_join_date;
-      const admin_state_ss = req.body.admin_state;
-      const admin_zipcode_ss = req.body.admin_zipcode;
-      const admin_password_ss = req.body.admin_password;
-      const admin_passowrd_enq_ss = make_password(req.body.admin_password);
+  try {
+    // 1) Verify requester is super_admin
+    const requesterId = req.body.requester_admin_id;
+    
+    if (!requesterId) {
+      return res.send({
+        error: true,
+        message: "requester_admin_id is required for this action",
+      });
+    }
 
-      let admin_image_ss = "";
+    const requester = await ethi_admin.findOne({
+      _id: requesterId,
+      flag: "c",
+    });
 
-      const query = {
-        $and: [
-          { admin_email: admin_email_ss },
-          { flag: "c" },
-          // Add more conditions as needed
-        ],
-      };
-      ethi_admin
-        .find(query)
-        .then((data) => {
-          if (data[0]) {
-            res.send({
-              message: already_exists,
-              error: true,
-            });
-          } else {
-            if (req.files?.admin_image_new) {
-              admin_image_ss = upload_image(
-                "_admin",
-                data_doctor_image,
-                req.files.admin_image_new
-              );
-            }
+    if (!requester) {
+      return res.send({
+        error: true,
+        message: "Requester admin not found or inactive",
+      });
+    }
 
-            const ethi_admin_data = new ethi_admin({
-              entry_date: currentDatetime(),
-              admin_name: admin_name_ss,
-              admin_mobile_no: admin_mobile_no_ss,
-              admin_email: admin_email_ss,
-              admin_image: admin_image_ss,
-              admin_type: admin_type_ss,
-              admin_city: admin_city_ss,
-              admin_country: admin_country_ss,
-              admin_education: admin_education_ss,
-              admin_join_date: admin_join_date_ss,
-              admin_state: admin_state_ss,
-              admin_zipcode: admin_zipcode_ss,
-              admin_password: admin_password_ss,
-              admin_passowrd_enq: admin_passowrd_enq_ss,
-              allow_access: "0",
-              flag: "c",
-            });
+    // ✅ Check if requester is super_admin
+    const isSuper = requester.role === "super_admin" || 
+                    requester.admin_type === "super_admin" ||
+                    requester.is_super_admin === true;
 
-            ethi_admin_data
-              .save()
-              .then((savedCustomer) => {
-                res.send({
-                  message: save_success,
-                  error: false,
-                });
-              })
-              .catch((err) => {
-                console.log(err);
-                res.send({
-                  message: error_msg,
-                  error: true,
-                });
-              });
-          }
-        })
-        .catch((err) => {
-          console.log(err);
-          res.send({
-            message: error_msg,
-            error: true,
-          });
-        });
-    } catch (error) {
-      console.log(error);
-      res.send({
-        message: error_msg,
+    if (!isSuper) {
+      return res.send({
+        error: true,
+        message: "🚫 Permission denied. Only Super Admin can add staff members.",
+      });
+    }
+
+    console.log(`✅ Staff being added by Super Admin: ${requester.admin_name}`);
+
+    // 2) Read staff fields from body
+    const admin_email_ss = req.body.admin_email;
+    const admin_name_ss = req.body.admin_name;
+    const admin_mobile_no_ss = req.body.admin_mobile_no;
+    const admin_type_ss = req.body.admin_type || "admin";
+    const admin_city_ss = req.body.admin_city;
+    const admin_country_ss = req.body.admin_country;
+    const admin_education_ss = req.body.admin_education;
+    const admin_join_date_ss = req.body.admin_join_date;
+    const admin_state_ss = req.body.admin_state;
+    const admin_zipcode_ss = req.body.admin_zipcode;
+    const admin_password_ss = req.body.admin_password;
+    const admin_passowrd_enq_ss = make_password(req.body.admin_password);
+
+    let admin_image_ss = "";
+
+    // 3) Do NOT allow creating another super_admin from UI
+    if (admin_type_ss === "super_admin" || admin_type_ss === "SUPER_ADMIN") {
+      return res.send({
+        error: true,
+        message: "❌ You cannot create another Super Admin from this screen.",
+      });
+    }
+
+    // 4) Check if email already exists
+    const query = {
+      $and: [{ admin_email: admin_email_ss }, { flag: "c" }],
+    };
+
+    const existing = await ethi_admin.find(query);
+    if (existing && existing[0]) {
+      return res.send({
+        message: already_exists,
         error: true,
       });
     }
+
+    // 5) If image uploaded, save it
+    if (req.files?.admin_image_new) {
+      admin_image_ss = upload_image(
+        "_admin",
+        data_doctor_image,
+        req.files.admin_image_new
+      );
+    }
+
+    // 6) Create new staff admin
+    const ethi_admin_data = new ethi_admin({
+      entry_date: currentDatetime(),
+      admin_name: admin_name_ss,
+      admin_mobile_no: admin_mobile_no_ss,
+      admin_email: admin_email_ss,
+      admin_image: admin_image_ss,
+      admin_type: "admin",
+      role: "admin",
+      is_super_admin: false,
+      admin_city: admin_city_ss,
+      admin_country: admin_country_ss,
+      admin_education: admin_education_ss,
+      admin_join_date: admin_join_date_ss,
+      admin_state: admin_state_ss,
+      admin_zipcode: admin_zipcode_ss,
+      admin_password: admin_password_ss,
+      admin_passowrd_enq: admin_passowrd_enq_ss,
+      allow_access: "1",
+      flag: "c",
+    });
+
+    await ethi_admin_data.save();
+
+    console.log(`✅ Normal Admin created: ${admin_name_ss} (${admin_email_ss})`);
+
+    return res.send({
+      message: save_success,
+      error: false,
+    });
+  } catch (error) {
+    console.error("❌ Add Staff Error:", error);
+    return res.send({
+      message: error_msg,
+      error: true,
+    });
   }
 };
 
+
 // Retrieve all ethi_admin from the database.
-exports.update_staff = (req, res) => {
+// Update staff admin (SUPER_ADMIN only)
+// Update staff admin (SUPER_ADMIN only)
+exports.update_staff = async (req, res) => {
   if (!req.body) {
-    res.send({
+    return res.send({
       message: post_empty,
       error: true,
     });
-  } else {
-    try {
-      const admin_email_ss = req.body.admin_email;
-      const admin_name_ss = req.body.admin_name;
-      const admin_mobile_no_ss = req.body.admin_mobile_no;
-      const admin_type_ss = req.body.admin_type;
-      const admin_city_ss = req.body.admin_city;
-      const admin_country_ss = req.body.admin_country;
-      const admin_education_ss = req.body.admin_education;
+  }
 
-      const admin_join_date_ss = req.body.admin_join_date;
-      const admin_state_ss = req.body.admin_state;
-      const admin_zipcode_ss = req.body.admin_zipcode;
-      const admin_password_ss = req.body.admin_password;
-      const admin_id_ss = req.body.admin_id;
-      let admin_image_ss = req.body.admin_old_image;
-      const admin_passowrd_enq_ss = make_password(req.body.admin_password);
+  try {
+    // 1) Only SUPER_ADMIN is allowed to update staff from this endpoint
+    const superAdmin = await assertSuperAdmin(req, res);
+    if (!superAdmin) {
+      return;
+    }
 
-      const query = {
-        $and: [
-          { admin_email: admin_email_ss },
-          { flag: "c" },
-          { _id: { $ne: admin_id_ss } }, // Replace your_id_value with the actual value you want to compare with
-        ],
-      };
+    const admin_email_ss = req.body.admin_email;
+    const admin_name_ss = req.body.admin_name;
+    const admin_mobile_no_ss = req.body.admin_mobile_no;
+    const admin_type_ss = req.body.admin_type;
+    const admin_city_ss = req.body.admin_city;
+    const admin_country_ss = req.body.admin_country;
+    const admin_education_ss = req.body.admin_education;
+    const admin_join_date_ss = req.body.admin_join_date;
+    const admin_state_ss = req.body.admin_state;
+    const admin_zipcode_ss = req.body.admin_zipcode;
+    const admin_password_ss = req.body.admin_password;
+    const admin_id_ss = req.body.admin_id;
+    let admin_image_ss = req.body.admin_old_image;
+    const admin_passowrd_enq_ss = make_password(req.body.admin_password);
 
-      ethi_admin
-        .find(query)
-        .then(async (data) => {
-          if (data[0]) {
-            res.send({
-              message: already_exists,
-              error: true,
-            });
-          } else {
-            if (req.files) {
-              admin_image_ss = upload_image(
-                "_admin",
-                data_doctor_image,
-                req.files.admin_image_new
-              );
-            }
-            console.log(admin_image_ss);
-            const update4 = {
-              $set: {
-                doctor_name: admin_name_ss,
-                doctor_admin_image: admin_image_ss,
-              },
-            };
-            const filter2 = {
-              admin_id: admin_id_ss,
-              flag: "c",
-            };
+    // 2) Prevent email duplication with other admins
+    const query = {
+      $and: [
+        { admin_email: admin_email_ss },
+        { flag: "c" },
+        { _id: { $ne: admin_id_ss } },
+      ],
+    };
 
-            await ethi_feeds_master.updateMany(filter2, update4, {
-              useFindAndModify: false,
-            });
-
-            const update = {
-              $set: {
-                admin_name: admin_name_ss,
-                admin_mobile_no: admin_mobile_no_ss,
-                admin_email: admin_email_ss,
-                admin_image: admin_image_ss,
-                admin_type: admin_type_ss,
-                admin_city: admin_city_ss,
-                admin_country: admin_country_ss,
-                admin_education: admin_education_ss,
-                admin_join_date: admin_join_date_ss,
-                admin_state: admin_state_ss,
-                admin_zipcode: admin_zipcode_ss,
-                admin_password: admin_password_ss,
-                admin_passowrd_enq: admin_passowrd_enq_ss,
-              },
-            };
-            const filter = {
-              _id: admin_id_ss,
-            };
-            await ethi_admin
-              .updateOne(filter, update, {
-                useFindAndModify: false,
-              })
-              .then((savedCustomer) => {
-                res.send({
-                  message: updated_success,
-                  error: false,
-                });
-              })
-              .catch((err) => {
-                console.log(err);
-                res.send({
-                  message: error_msg,
-                  error: true,
-                });
-              });
-          }
-        })
-        .catch((err) => {
-          console.log(err);
-          res.send({
-            message: error_msg,
-            error: true,
-          });
-        });
-    } catch (error) {
-      console.log(error);
-      res.send({
-        message: error_msg,
+    const existing = await ethi_admin.find(query);
+    if (existing && existing[0]) {
+      return res.send({
+        message: already_exists,
         error: true,
       });
     }
+
+    // 3) If new image uploaded -> upload
+    if (req.files && req.files.admin_image_new) {
+      admin_image_ss = upload_image(
+        "_admin",
+        data_doctor_image,
+        req.files.admin_image_new
+      );
+    }
+
+    // 4) Also update any feed entries where this admin is referenced
+    const updateFeeds = {
+      $set: {
+        doctor_name: admin_name_ss,
+        doctor_admin_image: admin_image_ss,
+      },
+    };
+    const filterFeeds = {
+      admin_id: admin_id_ss,
+      flag: "c",
+    };
+
+    await ethi_feeds_master.updateMany(filterFeeds, updateFeeds, {
+      useFindAndModify: false,
+    });
+
+    // 5) Finally update admin document
+    const updateAdmin = {
+      $set: {
+        admin_name: admin_name_ss,
+        admin_mobile_no: admin_mobile_no_ss,
+        admin_email: admin_email_ss,
+        admin_image: admin_image_ss,
+        admin_type: admin_type_ss,
+        admin_city: admin_city_ss,
+        admin_country: admin_country_ss,
+        admin_education: admin_education_ss,
+        admin_join_date: admin_join_date_ss,
+        admin_state: admin_state_ss,
+        admin_zipcode: admin_zipcode_ss,
+        admin_password: admin_password_ss,
+        admin_passowrd_enq: admin_passowrd_enq_ss,
+      },
+    };
+
+    const filterAdmin = {
+      _id: admin_id_ss,
+    };
+
+    await ethi_admin.updateOne(filterAdmin, updateAdmin, {
+      useFindAndModify: false,
+    });
+
+    return res.send({
+      message: updated_success,
+      error: false,
+    });
+  } catch (error) {
+    console.log(error);
+    return res.send({
+      message: error_msg,
+      error: true,
+    });
+  }
+};
+
+/**
+ * UPDATE OWN PROFILE - Any admin can update their own profile
+ * 
+ * Purpose: Allow both super_admin and normal admin to update their own profile
+ * Permission: Any logged-in admin
+ * Validation: Ensures admin_id matches requester_admin_id (cannot update others)
+ */
+exports.update_own_profile = async (req, res) => {
+  if (!req.body) {
+    return res.send({
+      message: post_empty,
+      error: true,
+    });
+  }
+
+  try {
+    // 1) Get requester admin
+    const requesterId = req.body.requester_admin_id;
+    const adminIdToUpdate = req.body.admin_id;
+
+    if (!requesterId) {
+      return res.send({
+        error: true,
+        message: "requester_admin_id is required for this action",
+      });
+    }
+
+    if (!adminIdToUpdate) {
+      return res.send({
+        error: true,
+        message: "admin_id is required",
+      });
+    }
+
+    // 2) Verify requester exists and is active
+    const requester = await ethi_admin.findOne({
+      _id: requesterId,
+      flag: "c",
+      allow_access: "1",
+    });
+
+    if (!requester) {
+      return res.send({
+        error: true,
+        message: "Requester admin not found or inactive",
+      });
+    }
+
+    // 3) ✅ CRITICAL: Admin can ONLY update their own profile
+    if (requesterId !== adminIdToUpdate) {
+      return res.send({
+        error: true,
+        message: "❌ You can only update your own profile. Use staff management to edit other admins.",
+      });
+    }
+
+    console.log(`✅ ${requester.admin_name} updating own profile...`);
+
+    // 4) Read profile fields from body
+    const admin_email_ss = req.body.admin_email;
+    const admin_name_ss = req.body.admin_name;
+    const admin_mobile_no_ss = req.body.admin_mobile_no;
+    const admin_city_ss = req.body.admin_city;
+    const admin_country_ss = req.body.admin_country;
+    const admin_education_ss = req.body.admin_education;
+    const admin_join_date_ss = req.body.admin_join_date;
+    const admin_state_ss = req.body.admin_state;
+    const admin_zipcode_ss = req.body.admin_zipcode;
+    const admin_password_ss = req.body.admin_password;
+    let admin_image_ss = req.body.admin_old_image;
+    const admin_passowrd_enq_ss = make_password(admin_password_ss);
+
+    // 5) Prevent email duplication with other admins
+    const query = {
+      $and: [
+        { admin_email: admin_email_ss },
+        { flag: "c" },
+        { _id: { $ne: adminIdToUpdate } },
+      ],
+    };
+
+    const existing = await ethi_admin.find(query);
+    if (existing && existing[0]) {
+      return res.send({
+        message: already_exists,
+        error: true,
+      });
+    }
+
+    // 6) If new image uploaded -> process and save with optimization
+    if (req.files && req.files.admin_image) {
+      console.log('📸 Processing admin profile image...');
+      
+      const imageResult = await processAndSaveImage(
+        req.files.admin_image,
+        '/ethi_doctor_image/',
+        '_admin',
+        {
+          size: 'passport',        // 200x200 passport size
+          quality: 85,             // Good quality
+          format: 'jpeg',          // JPEG format
+          oldImageName: admin_image_ss, // Delete old image
+        }
+      );
+
+      if (imageResult.success) {
+        admin_image_ss = imageResult.filename;
+        console.log(`✅ Image saved: ${admin_image_ss}`);
+      } else {
+        console.error('❌ Image processing failed:', imageResult.error);
+        return res.send({
+          message: 'Failed to process image. Please try again.',
+          error: true,
+        });
+      }
+    }
+
+    // 7) Update admin document (preserve role and is_super_admin)
+    const updateAdmin = {
+      $set: {
+        admin_name: admin_name_ss,
+        admin_mobile_no: admin_mobile_no_ss,
+        admin_email: admin_email_ss,
+        admin_image: admin_image_ss,
+        admin_city: admin_city_ss,
+        admin_country: admin_country_ss,
+        admin_education: admin_education_ss,
+        admin_join_date: admin_join_date_ss,
+        admin_state: admin_state_ss,
+        admin_zipcode: admin_zipcode_ss,
+        admin_password: admin_password_ss,
+        admin_passowrd_enq: admin_passowrd_enq_ss,
+      },
+    };
+
+    const filterAdmin = {
+      _id: adminIdToUpdate,
+    };
+
+    await ethi_admin.updateOne(filterAdmin, updateAdmin, {
+      useFindAndModify: false,
+    });
+
+    console.log(`✅ Profile updated successfully: ${admin_name_ss}`);
+
+    return res.send({
+      message: "Profile updated successfully! 👤",
+      error: false,
+    });
+  } catch (error) {
+    console.error("❌ Update Own Profile Error:", error);
+    return res.send({
+      message: error_msg,
+      error: true,
+    });
   }
 };
 
@@ -1743,13 +2062,34 @@ exports.update_doctor = async (req, res) => {
             });
           } else {
             
-            if (req.files) {
-              doctor_image_ss = upload_image(
-                "_doctor",
-                data_doctor_image,
-                req.files.doctor_image_new
+            // 📸 Process doctor image upload with optimization
+            if (req.files && req.files.doctor_image_new) {
+              console.log('📸 Processing doctor profile image...');
+              
+              const imageResult = await processAndSaveImage(
+                req.files.doctor_image_new,
+                '/ethi_doctor_image/',
+                '_doctor',
+                {
+                  size: 'passport',        // 200x200 passport size
+                  quality: 85,             // Good quality
+                  format: 'jpeg',          // JPEG format
+                  oldImageName: doctor_image_ss, // Delete old image
+                }
               );
+
+              if (imageResult.success) {
+                doctor_image_ss = imageResult.filename;
+                console.log(`✅ Doctor image saved: ${doctor_image_ss}`);
+              } else {
+                console.error('❌ Image processing failed:', imageResult.error);
+                return res.send({
+                  message: 'Failed to process image. Please try again.',
+                  error: true,
+                });
+              }
             }
+            
             const update2 = {
               $set: {
                 doctor_name: doctor_image_ss,
@@ -1959,6 +2299,7 @@ exports.get_leaves = async (req, res) => {
     }
   }
 }; // Retrieve all ethi_admin from the database.
+
 exports.update_leaves = async (req, res) => {
   if (!req.body) {
     res.send({
@@ -2071,130 +2412,147 @@ exports.update_leaves = async (req, res) => {
 };
 
 // Retrieve all ethi_admin from the database.
-exports.add_doctor = (req, res) => {
+/**
+ * ✅ ADD DOCTOR - Works for BOTH Super Admin AND Normal Admin
+ * 
+ * Permission: Super Admin + Normal Admin
+ * Validates: Doctor email must be unique
+ */
+exports.add_doctor = async (req, res) => {
   if (!req.body) {
-    res.send({
+    return res.send({
       message: post_empty,
       error: true,
     });
-  } else {
-    try {
-      const doctor_email_ss = req.body.doctor_email;
-      const doctor_name_ss = req.body.doctor_name;
-      const doctor_profession_ss = req.body.doctor_profession;
-      const doctor_mobile_no_ss = req.body.doctor_mobile_no;
-      const doctor_city_ss = req.body.doctor_city;
-      const doctor_state_ss = req.body.doctor_state;
-      const doctor_country_ss = req.body.doctor_country;
-      const doctor_zipcode_ss = req.body.doctor_zipcode;
+  }
 
-      const doctor_education_ss = req.body.doctor_education;
-      const doctor_exp_years_ss = req.body.doctor_exp_years;
-      const doctor_join_date_ss = req.body.doctor_join_date_ss;
-      const doctor_about_us_ss = req.body.about_us;
-      const doctor_leave_allow_ss = req.body.doctor_leave_allow;
-      const doctor_password_ss = req.body.doctor_password;
-      const doctor_passowrd_enq_ss = make_password(req.body.doctor_password);
-      const doctor_goals = req.body.doctor_goals;
-
-      let doctor_image_ss = "";
-
-      const query = {
-        $and: [
-          { doctor_email: doctor_email_ss },
-          { flag: "c" },
-          // Add more conditions as needed
-        ],
-      };
-
-      ethi_doctor_master
-        .find(query)
-        .then((data) => {
-          if (data[0]) {
-            res.send({
-              message: already_exists,
-              error: true,
-            });
-          } else {
-            if (req.files?.doctor_image_new) {
-              doctor_image_ss = upload_image(
-                "_doctor",
-                data_doctor_image,
-                req.files.doctor_image_new
-              );
-            }
-
-            const ethi_doctor_master_data = new ethi_doctor_master({
-              entry_date: currentDatetime(),
-              doctor_name: doctor_name_ss,
-              doctor_profession: doctor_profession_ss,
-              doctor_image: doctor_image_ss,
-              doctor_email: doctor_email_ss,
-              doctor_mobile_no: doctor_mobile_no_ss,
-              doctor_city: doctor_city_ss,
-              doctor_state: doctor_state_ss,
-              doctor_zipcode: doctor_zipcode_ss,
-              doctor_country: doctor_country_ss,
-              doctor_education: doctor_education_ss,
-              doctor_exp_years: doctor_exp_years_ss,
-              doctor_join_date: doctor_join_date_ss,
-              doctor_about_us: doctor_about_us_ss,
-              doctor_leave_allow: doctor_leave_allow_ss,
-              doctor_leave_used: 0,
-              doctor_password: doctor_password_ss,
-              doctor_passowrd_enq: doctor_passowrd_enq_ss,
-              allow_access: "0",
-              flag: "c",
-            });
-
-            ethi_doctor_master_data
-              .save()
-              .then((savedCustomer) => {
-                for (let i = 1; i < doctor_goals.length; i++) {
-                  let main_goal = doctor_goals[i].split("~@~");
-                  const ethi_supplement_master_ss = new ethi_doctors_goals({
-                    entry_date: currentDatetime(),
-                    doctor_id: savedCustomer._id,
-                    goal_id: main_goal[0],
-                    doctor_goal_name: main_goal[1],
-                    doctor_goal_detail: main_goal[2],
-                    doctor_goal_image: main_goal[3],
-                    flag: "c",
-                  });
-
-                  ethi_supplement_master_ss.save();
-                }
-
-                res.send({
-                  message: save_success,
-                  error: false,
-                });
-              })
-              .catch((err) => {
-                console.log(err);
-                res.send({
-                  message: error_msg,
-                  error: true,
-                });
-              });
-          }
-        })
-        .catch((err) => {
-          console.log(err);
-          res.send({
-            message: error_msg,
-            error: true,
-          });
+  try {
+    // ✅ Optional: Verify requester is logged in admin (super_admin OR admin)
+    const requesterId = req.body.requester_admin_id;
+    
+    if (requesterId) {
+      const requester = await ethi_admin.findOne({
+        _id: requesterId,
+        flag: "c",
+        allow_access: "1"
+      });
+      
+      if (!requester) {
+        return res.send({
+          error: true,
+          message: "Invalid admin session. Please login again.",
         });
-    } catch (error) {
-      console.log(error);
-      res.send({
-        message: error_msg,
+      }
+      
+      // ✅ Both super_admin and admin can add doctors
+      console.log(`✅ Doctor being added by: ${requester.admin_name} (${requester.role || requester.admin_type})`);
+    }
+
+    // Extract doctor data
+    const doctor_email_ss = req.body.doctor_email;
+    const doctor_name_ss = req.body.doctor_name;
+    const doctor_profession_ss = req.body.doctor_profession;
+    const doctor_mobile_no_ss = req.body.doctor_mobile_no;
+    const doctor_city_ss = req.body.doctor_city;
+    const doctor_state_ss = req.body.doctor_state;
+    const doctor_country_ss = req.body.doctor_country;
+    const doctor_zipcode_ss = req.body.doctor_zipcode;
+    const doctor_education_ss = req.body.doctor_education;
+    const doctor_exp_years_ss = req.body.doctor_exp_years;
+    const doctor_join_date_ss = req.body.doctor_join_date_ss;
+    const doctor_about_us_ss = req.body.about_us;
+    const doctor_leave_allow_ss = req.body.doctor_leave_allow;
+    const doctor_password_ss = req.body.doctor_password;
+    const doctor_passowrd_enq_ss = make_password(req.body.doctor_password);
+    const doctor_goals = req.body.doctor_goals;
+
+    let doctor_image_ss = "";
+
+    // Check if doctor already exists
+    const query = {
+      $and: [
+        { doctor_email: doctor_email_ss },
+        { flag: "c" },
+      ],
+    };
+
+    const existingDoctor = await ethi_doctor_master.find(query);
+
+    if (existingDoctor && existingDoctor[0]) {
+      return res.send({
+        message: already_exists,
         error: true,
       });
     }
+
+    // Handle image upload
+    if (req.files?.doctor_image_new) {
+      doctor_image_ss = upload_image(
+        "_doctor",
+        data_doctor_image,
+        req.files.doctor_image_new
+      );
+    }
+
+    // Create new doctor
+    const ethi_doctor_master_data = new ethi_doctor_master({
+      entry_date: currentDatetime(),
+      doctor_name: doctor_name_ss,
+      doctor_profession: doctor_profession_ss,
+      doctor_image: doctor_image_ss,
+      doctor_email: doctor_email_ss,
+      doctor_mobile_no: doctor_mobile_no_ss,
+      doctor_city: doctor_city_ss,
+      doctor_state: doctor_state_ss,
+      doctor_zipcode: doctor_zipcode_ss,
+      doctor_country: doctor_country_ss,
+      doctor_education: doctor_education_ss,
+      doctor_exp_years: doctor_exp_years_ss,
+      doctor_join_date: doctor_join_date_ss,
+      doctor_about_us: doctor_about_us_ss,
+      doctor_leave_allow: doctor_leave_allow_ss,
+      doctor_leave_used: 0,
+      doctor_password: doctor_password_ss,
+      doctor_passowrd_enq: doctor_passowrd_enq_ss,
+      allow_access: "1", // ✅ Changed to "1" so doctor can login immediately
+      flag: "c",
+    });
+
+    const savedDoctor = await ethi_doctor_master_data.save();
+
+    // Save doctor goals
+    if (doctor_goals && doctor_goals.length > 1) {
+      for (let i = 1; i < doctor_goals.length; i++) {
+        let main_goal = doctor_goals[i].split("~@~");
+        const ethi_supplement_master_ss = new ethi_doctors_goals({
+          entry_date: currentDatetime(),
+          doctor_id: savedDoctor._id,
+          goal_id: main_goal[0],
+          doctor_goal_name: main_goal[1],
+          doctor_goal_detail: main_goal[2],
+          doctor_goal_image: main_goal[3],
+          flag: "c",
+        });
+
+        await ethi_supplement_master_ss.save();
+      }
+    }
+
+    console.log(`✅ Doctor created: ${doctor_name_ss} (${doctor_email_ss})`);
+
+    return res.send({
+      message: save_success,
+      error: false,
+    });
+  } catch (err) {
+    console.error("❌ Add Doctor Error:", err);
+    return res.send({
+      message: error_msg,
+      error: true,
+    });
   }
 };
+
 
 // Retrieve all ethi_admin from the database.
 exports.get_all_staff = async (req, res) => {
@@ -2249,42 +2607,64 @@ exports.get_all_staff = async (req, res) => {
 };
 
 // Retrieve all ethi_admin from the database.
+// Get admin list (role-based)
+// - SUPER_ADMIN  => sees all admins
+// - ADMIN        => sees only his own record
 exports.get_all_admin = async (req, res) => {
   if (!req.body) {
-    res.send({
+    return res.send({
       message: post_empty,
       error: true,
     });
-  } else {
-    try {
-      var condition = {
-        flag: "c",
-      };
+  }
 
-      // Fetch data from Collection1 with condition
-      const data_admin = await ethi_admin
-        .find(condition)
-        .sort({ createdAt: -1 })
-        .exec();
-
-      // Combine the results into a single object
-      const responseData = {
-        data_admin,
-        data_doctor_image,
-      };
-      res.send({
-        message: responseData,
-        error: false,
-      });
-    } catch (error) {
-      console.log(error);
-      res.send({
-        message: error_msg,
-        error: true,
-      });
+  try {
+    const requester = await getRequesterAdmin(req, res);
+    if (!requester) {
+      // error already sent
+      return;
     }
+
+    let condition = {
+      flag: "c",
+    };
+
+    // ✅ Check if requester is super_admin (lowercase)
+    const isSuper = requester.role === "super_admin" || 
+                    requester.admin_type === "super_admin" ||
+                    requester.is_super_admin === true;
+
+    // SUPER_ADMIN => sees all admins (including themselves)
+    // Normal ADMIN => sees only themselves
+    if (!isSuper) {
+      condition._id = requester._id;
+    }
+
+    const data_admin = await ethi_admin
+      .find(condition)
+      .sort({ createdAt: -1 })
+      .exec();
+
+    console.log(`✅ ${requester.admin_name} viewing ${data_admin.length} admin(s)`);
+
+    const responseData = {
+      data_admin,
+      data_doctor_image,
+    };
+
+    return res.send({
+      message: responseData,
+      error: false,
+    });
+  } catch (error) {
+    console.log(error);
+    return res.send({
+      message: error_msg,
+      error: true,
+    });
   }
 };
+
 
 exports.upload_supplements = async (req, res) => {
   if (!req.body) {
@@ -2907,14 +3287,21 @@ function upload_image(only_side_name, path_name_only, image_file) {
     image_name = md5HashValue + only_side_name + image_type;
     const path_name = targetDir + "assets" + path_name_only + image_name;
 
+    console.log("📸 Uploading Image:");
+    console.log("  - Filename:", image_name);
+    console.log("  - Target Path:", path_name);
+    console.log("  - File Size:", image_file.size, "bytes");
+
     image_file.mv(path_name, (err) => {
       if (err) {
-        //err
+        console.error("❌ Image Upload Error:", err);
+        console.error("  - Failed Path:", path_name);
+      } else {
+        console.log("✅ Image uploaded successfully:", image_name);
       }
     });
   } catch (error) {
-    console.log(error);
-    //err
+    console.error("❌ Upload Function Error:", error);
   }
 
   return image_name;
